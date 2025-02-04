@@ -2,39 +2,8 @@ import os
 import json
 from typing import List, Dict
 
-import pandas as pd
-import numpy as np
-
-
-def compute_avg_product_age_per_session(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Given a DataFrame with columns:
-      - 'session_id': identifies each session
-      - 'session_date': date/time of the session
-      - 'product_launch_date': when the product was first made available
-      - 'partnumber': product identifier
-
-    1) Creates 'days_since_launch' = (session_date - product_launch_date) in days.
-    2) Groups by session_id to find the average days_since_launch in that session.
-    Returns a new DataFrame: [session_id, avg_days_since_launch].
-    """
-
-    # 1) Ensure both are datetime
-    df = df.copy()
-    if not pd.api.types.is_datetime64_any_dtype(df['date']):
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-
-    if not pd.api.types.is_datetime64_any_dtype(df['product_launch_date']):
-        df['product_launch_date'] = pd.to_datetime(df['product_launch_date'], errors='coerce')
-
-    df['days_since_launch'] = (df['date'] - df['product_launch_date']).dt.days
-
-    avg_days_per_session = df.groupby('session_id')['days_since_launch'].mean().reset_index(
-        name='avg_days_since_launch')
-    count_per_session = df.groupby('session_id').size().reset_index(name='count')
-    avg_days_per_session = avg_days_per_session.merge(count_per_session, on='session_id', how='inner')
-
-    return avg_days_per_session
+from pandas import DataFrame, api, to_datetime, isna, read_csv
+from numpy import log2, mean
 
 
 class MetricsService:
@@ -42,11 +11,7 @@ class MetricsService:
     Holds methods for computing recommendation metrics such as NDCG.
     """
     @staticmethod
-    def calculate_ndcg(
-        session_recommendations: dict,
-        eval_session_product_map: dict,
-        k: int = 5
-    ) -> float:
+    def calculate_ndcg(session_recommendations: dict, eval_session_product_map: dict, k: int = 5) -> float:
         """
         Calculates NDCG@k for a set of recommendations.
         session_recommendations: {session_id (as str): [recommended partnumbers]}
@@ -61,21 +26,27 @@ class MetricsService:
             dcg = 0.0
             for idx, item in enumerate(top_items):
                 if item in relevant_items:
-                    dcg += 1 / np.log2(idx + 2)
+                    dcg += 1 / log2(idx + 2)
 
-            idcg = sum(1 / np.log2(i + 2) for i in range(min(len(relevant_items), k)))
+            idcg = sum(1 / log2(i + 2) for i in range(min(len(relevant_items), k)))
             ndcg = dcg / idcg if idcg > 0 else 0
             ndcg_scores.append(ndcg)
 
-        return np.mean(ndcg_scores)
+        return mean(ndcg_scores)
 
 
 class Recommender:
     """
     Contains the logic to generate recommendations based on time spent, discount info, and popularity.
     """
-    def __init__(self, top_similar_dict: dict, top_similar_products_item_based: dict, bought_together_map: dict, popular_family_products: dict):
-        self.top_similar_dict = top_similar_dict
+    def __init__(
+        self,
+        top_similar_map: Dict[str, Dict[str, str]],
+        top_similar_products_item_based: Dict[str, Dict[str, str]],
+        bought_together_map: Dict[str, List[int]],
+        popular_family_products: Dict[str, Dict[str, List[int]]]
+    ):
+        self.top_similar_map = top_similar_map
         self.top_similar_products_item_based = top_similar_products_item_based
         self.bought_together_map = bought_together_map
         self.popular_family_products = popular_family_products
@@ -110,7 +81,7 @@ class Recommender:
     def recommend_by_frequency(
         basket: List[int],
         recommendations: List[int],
-        similar_dict: Dict[str, List[int]],
+        similar_map: Dict[str, List[int]],
         out_of_stock_country: List[int],
         target_products: set,
         top_n: int = 5
@@ -125,7 +96,7 @@ class Recommender:
 
         for product_in_basket in basket:
             # Convert product_in_basket to string if your dict keys are str
-            candidates = similar_dict.get(str(product_in_basket), [])
+            candidates = similar_map.get(str(product_in_basket), [])
             candidates = [candidate for candidate in candidates if candidate not in out_of_stock_country]
             candidates = [candidate for candidate in candidates if candidate in target_products][:5]
             for candidate in candidates:
@@ -144,7 +115,7 @@ class Recommender:
         return recommendations
 
     @staticmethod
-    def adding_user_profile_info(user_profile: dict) -> List[int]:
+    def adding_user_profile_info(user_profile: Dict[str, dict]) -> List[int]:
 
         not_bought_sorted = []
         category_fam_popularity = []
@@ -163,13 +134,12 @@ class Recommender:
 
     def recommend_products_for_session(
         self,
-        session_data: pd.DataFrame,
-        products_metrics_df: pd.DataFrame,
-        top_products_for_country: dict,
-        bought_together_map: dict,
+        session_data: DataFrame,
+        products_metrics_df: DataFrame,
+        top_products_for_country: Dict[str, str],
         popular_products: List[int],
-        discount_map: dict,
-        user_profile: dict,
+        discount_map: Dict[str, bool],
+        user_profile: Dict[str, Dict[str, dict]],
         out_of_stock_country: List[int],
         N: int = 5
     ) -> List[int]:
@@ -203,7 +173,7 @@ class Recommender:
         product_counts = session_data['partnumber'].value_counts()
         time_stats = session_data.groupby('partnumber')['time_to_next_seconds'].max()
         ratio_stats = session_data.groupby('partnumber')['ratio'].first()
-        viewed_df = pd.DataFrame({'count': product_counts, 'time_max': time_stats, 'ratio': ratio_stats})
+        viewed_df = DataFrame({'count': product_counts, 'time_max': time_stats, 'ratio': ratio_stats})
         viewed_df['discount'] = viewed_df.index.map(lambda p: discount_map.get(str(p), False))
 
         # Sort by count desc, then time_max desc
@@ -221,7 +191,7 @@ class Recommender:
         # Step 2: If not enough, add co bought products
         if len(recommendations) < N:
             recommendations = self.recommend_co_bought_items(
-                viewed_products, recommendations, bought_together_map, out_of_stock_country,
+                viewed_products, recommendations, self.bought_together_map, out_of_stock_country,
                 max(0, 5 - len(recommendations))
             )
 
@@ -252,7 +222,7 @@ class Recommender:
         if len(recommendations) < N:
             for viewed_product in viewed_products:
                 family = str(session_data[session_data['partnumber'] == viewed_product]['family'].values[0])
-                if pd.isna(session_data[session_data['partnumber'] == viewed_product]['cod_section'].values[0]):
+                if isna(session_data[session_data['partnumber'] == viewed_product]['cod_section'].values[0]):
                     continue
                 section = str(int(session_data[session_data['partnumber'] == viewed_product]['cod_section'].values[0]))
                 key = section + '_' + family
@@ -276,12 +246,12 @@ class Recommender:
 
     def generate_session_recommendations(
         self,
-        test_df: pd.DataFrame,
-        products_metrics_df: pd.DataFrame,
+        test_df: DataFrame,
+        products_metrics_df: DataFrame,
         popular_products: List[int],
-        discount_map: dict,
-        user_profiles: dict,
-        out_of_stock: dict,
+        discount_map: Dict[str, bool],
+        user_profiles: Dict[str, Dict[str, dict]],
+        out_of_stock: Dict[str, List[int]],
         N: int = 5
     ) -> Dict[str, List[int]]:
         """
@@ -294,8 +264,7 @@ class Recommender:
         for session_id in test_df['session_id'].unique():
             session_data = test_df[test_df['session_id'] == session_id]
             session_country = session_data['country'].iloc[0]
-            top_products_for_country = self.top_similar_dict[str(session_country)]
-            bought_together_map_for_country = self.bought_together_map
+            top_products_for_country = self.top_similar_map[str(session_country)]
             out_of_stock_country = out_of_stock[str(session_country)]
             user_id = session_data['user_id'].iloc[0]
             user_profile = user_profiles.get(user_id, {})
@@ -304,7 +273,6 @@ class Recommender:
                 session_data=session_data,
                 products_metrics_df=products_metrics_df,
                 top_products_for_country=top_products_for_country,
-                bought_together_map=bought_together_map_for_country,
                 popular_products=popular_products,
                 discount_map=discount_map,
                 out_of_stock_country=out_of_stock_country,
@@ -326,19 +294,10 @@ def predict(no_components: int, percentile_visits: float, percentile_purchases: 
       4) Save recommendations as JSON
     """
     # 1. Load data
-    test_df = pd.read_csv('data/processed/test.csv')
-    session_type_df = pd.read_csv('data/processed/session_type.csv')
-    products_metrics_df = pd.read_csv('data/processed/product_metrics_data.csv')
+    test_df = read_csv('data/processed/test.csv')
+    session_type_df = read_csv('data/processed/session_type.csv')
+    products_metrics_df = read_csv('data/processed/product_metrics_data.csv')
 
-    test_df = test_df. \
-        merge(
-            products_metrics_df[['partnumber', 'country', 'product_launch_date']],
-            on=['partnumber', 'country'],
-            how='left'
-        )
-
-    avg_days_per_session = compute_avg_product_age_per_session(test_df)
-    test_df = test_df.merge(avg_days_per_session, on='session_id', how='inner')
     test_df = test_df.merge(session_type_df, on='session_id', how='inner')
 
     with open(f'data/processed/similar_products_lightfm/top_similar_products_{no_components}_{percentile_visits}_{percentile_purchases}.json', 'rb') as f:
@@ -391,19 +350,10 @@ def evaluate(no_components: int, percentile_visits: float, percentile_purchases:
       4) Save evaluation as JSON
     """
     # 1. Load data
-    eval_df = pd.read_csv('data/processed/eval.csv')
-    session_type_df = pd.read_csv('data/processed/eval_session_type.csv')
-    products_metrics_df = pd.read_csv('data/processed/product_metrics_data.csv')
+    eval_df = read_csv('data/processed/eval.csv')
+    session_type_df = read_csv('data/processed/eval_session_type.csv')
+    products_metrics_df = read_csv('data/processed/product_metrics_data.csv')
 
-    eval_df = eval_df. \
-        merge(
-            products_metrics_df[['partnumber', 'country', 'product_launch_date']],
-            on=['partnumber', 'country'],
-            how='left'
-        )
-
-    avg_days_per_session = compute_avg_product_age_per_session(eval_df)
-    eval_df = eval_df.merge(avg_days_per_session, on='session_id', how='inner')
     eval_df = eval_df.merge(session_type_df, on='session_id', how='inner')
 
     with open(f'data/processed/similar_products_lightfm/top_similar_products_{no_components}_{percentile_visits}_{percentile_purchases}.json', 'rb') as f:
